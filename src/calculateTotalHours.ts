@@ -19,7 +19,18 @@ dotenv.config({ path: path.join(__dirname, "../.env") });
 
 const pipelineAsync = promisify(pipeline);
 
-// 
+// Dear Programmer:-
+// When i wrote this code, only god and
+// i knew how it worked.
+// Now only god knows it.
+//
+// Therefore, if you are trying to optimize
+// this routine and it fails (most surely),
+// please increase this counter as a 
+// warning for the next developer: 
+//
+// total_hours_wasted_here: 14
+// total_wasted_coffee_cups: 12
 
 // ================= CONFIG & CREDENTIALS =================
 const MONGO_URI =
@@ -45,17 +56,6 @@ const TEST_SINGLE_STATION = false;
 
 // Optional filter for a specific station (e.g. "vehicle-counter-unprocessed-video/27 june/059"), or null for ALL stations
 const TARGET_STATION_FILTER: string | null = null;
-
-// Filter and process ONLY stations that appear 2+ times in the Excel sheet (set to false to process all stations)
-const ONLY_DUPLICATES_FILTER: boolean = process.env.ONLY_DUPLICATES !== "false";
-
-// Optional: Resume from a specific station ID (e.g. "vehicle-counter-unprocessed-video/3 july/029")
-const START_STATION: string | null = process.env.START_STATION || null;
-
-// Optional: Resume from 0-based index
-const START_INDEX: number = process.env.START_INDEX
-  ? parseInt(process.env.START_INDEX, 10)
-  : 0;
 
 // ================= S3 CLIENT =================
 const s3Client = new S3Client({
@@ -85,12 +85,6 @@ function probeDuration(inputUrlOrFile: string): Promise<number> {
     const args = [
       "-v",
       "error",
-      "-rw_timeout",
-      "5000000", // 5s network timeout in microseconds
-      "-probesize",
-      "32768", // Read max 32KB for header duration to avoid deep stream parsing
-      "-analyzeduration",
-      "0", // Stop analyzing stream data immediately after reading container header
       "-show_entries",
       "format=duration",
       "-of",
@@ -494,40 +488,6 @@ async function main() {
     }
   }
 
-  // Count total occurrences of each station in Excel sheet
-  const stationTotalCountsInSheet = new Map<string, number>();
-  for (const t of stationTasks) {
-    const norm = normalizeStationId(t.stationIdMongo);
-    stationTotalCountsInSheet.set(
-      norm,
-      (stationTotalCountsInSheet.get(norm) || 0) + 1
-    );
-  }
-
-  // Filter to duplicate stations if ONLY_DUPLICATES_FILTER is true
-  if (ONLY_DUPLICATES_FILTER && !TARGET_STATION_FILTER) {
-    const duplicateTasks = stationTasks.filter((t) => {
-      const norm = normalizeStationId(t.stationIdMongo);
-      return (stationTotalCountsInSheet.get(norm) || 0) > 1;
-    });
-
-    if (duplicateTasks.length > 0) {
-      console.log(
-        `\n [DUPLICATE FILTER] Found ${duplicateTasks.length} row(s) for stations that appear multiple times in Excel sheet. Processing matched stations only...`
-      );
-      stationTasks = duplicateTasks;
-    } else {
-      console.log(
-        `\n [DUPLICATE FILTER] No duplicate stations found in Excel sheet. Processing all stations...`
-      );
-    }
-  }
-
-  const stationVideoOffsetMap = new Map<string, number>();
-  const stationOccurrenceTracker = new Map<string, number>();
-  const stationRunAccumulatedHoursMap = new Map<string, number>();
-
-  let resumeIndex = 0;
   if (TARGET_STATION_FILTER) {
     const normTarget = normalizeStationId(TARGET_STATION_FILTER);
     const filteredTasks = stationTasks.filter((t) => {
@@ -557,50 +517,6 @@ async function main() {
         },
       ];
     }
-  } else if (START_STATION) {
-    const normStart = normalizeStationId(START_STATION);
-    const startIdx = stationTasks.findIndex((t) => {
-      return (
-        normalizeStationId(t.stationIdMongo).includes(normStart) ||
-        normalizeStationId(t.camIdExcelOrS3).includes(normStart) ||
-        normalizeStationId(t.s3Prefix).includes(normStart)
-      );
-    });
-
-    if (startIdx !== -1) {
-      resumeIndex = startIdx;
-      console.log(
-        `\n [RESUME] Found starting station '${START_STATION}' at position ${startIdx + 1}/${stationTasks.length}. Slicing remaining ${stationTasks.length - startIdx} task(s)...`
-      );
-    } else {
-      console.warn(
-        `\n [WARNING] Starting station '${START_STATION}' not found in task list.`
-      );
-      if (START_INDEX > 0 && START_INDEX < stationTasks.length) {
-        resumeIndex = START_INDEX;
-        console.log(
-          ` [RESUME] Falling back to start from index ${START_INDEX}...`
-        );
-      }
-    }
-  } else if (START_INDEX > 0 && START_INDEX < stationTasks.length) {
-    resumeIndex = START_INDEX;
-    console.log(
-      `\n [RESUME] Starting from index ${START_INDEX} (${stationTasks.length - START_INDEX} remaining task(s)).`
-    );
-  }
-
-  // Pre-calculate video offsets for tasks before resumeIndex
-  for (let k = 0; k < resumeIndex; k++) {
-    const t = stationTasks[k];
-    const normKey = normalizeStationId(t.stationIdMongo);
-    const prev = stationVideoOffsetMap.get(normKey) || 0;
-    const req = t.processedCountReq || 0;
-    stationVideoOffsetMap.set(normKey, prev + req);
-  }
-
-  if (resumeIndex > 0) {
-    stationTasks = stationTasks.slice(resumeIndex);
   }
 
   const isTestMode =
@@ -617,80 +533,97 @@ async function main() {
   const summaryReport: any[] = [];
   let processedStationCount = 0;
 
+  // Track S3 video offset index and cumulative totalHours for stations that appear multiple times
+  const stationStateMap = new Map<
+    string,
+    { startIndex: number; runningTotalHours: number }
+  >();
+
   for (let i = 0; i < stationTasks.length; i++) {
     const task = stationTasks[i];
-    const normKey = normalizeStationId(task.stationIdMongo);
-    const videoOffset = stationVideoOffsetMap.get(normKey) || 0;
-    const occurrence = (stationOccurrenceTracker.get(normKey) || 0) + 1;
-    stationOccurrenceTracker.set(normKey, occurrence);
+    const normKey = normalizeStationId(task.camIdExcelOrS3);
+    const existingState = stationStateMap.get(normKey) || {
+      startIndex: 0,
+      runningTotalHours: 0,
+    };
+    const startIndex = existingState.startIndex;
+    const prevTotalHours = existingState.runningTotalHours;
 
     console.log(`\n-------------------------------------------------`);
-    console.log(`[Station ${i + 1}/${stationTasks.length}] Task Details (Occurrence #${occurrence}):`);
+    console.log(`[Task ${i + 1}/${stationTasks.length}] Station Details:`);
     console.log(` - Excel/S3 Cam ID  : ${task.camIdExcelOrS3}`);
     console.log(` - MongoDB stationId : ${task.stationIdMongo}`);
     console.log(` - S3 Prefix        : ${task.s3Prefix}`);
-    if (videoOffset > 0) {
-      console.log(` - Video Start Offset: ${videoOffset} (from previous occurrences)`);
+    if (startIndex > 0) {
+      console.log(
+        ` - Multi-entry station! Resuming from S3 video index ${startIndex + 1} (Previous Accumulated Hours: ${prevTotalHours} hrs)`
+      );
     }
 
     // Fetch videos from S3
-    console.log(` [LOG] Querying S3 bucket '${AWS_BUCKET_NAME}' for prefix '${task.s3Prefix}'...`);
+    console.log(
+      ` [LOG] Querying S3 bucket '${AWS_BUCKET_NAME}' for prefix '${task.s3Prefix}'...`
+    );
     const allVideos = await listVideosInS3(task.s3Prefix);
-    console.log(` [LOG] Total matching video files found in S3: ${allVideos.length}`);
+    console.log(
+      ` [LOG] Total matching video files found in S3: ${allVideos.length}`
+    );
 
     if (allVideos.length === 0) {
-      console.warn(` [Warning] No videos found under S3 prefix '${task.s3Prefix}'.`);
+      console.warn(
+        ` [Warning] No videos found under S3 prefix '${task.s3Prefix}'.`
+      );
       if (isTestMode) {
-        console.log(` [TEST MODE] Skipping empty prefix and checking next station...`);
+        console.log(
+          ` [TEST MODE] Skipping empty prefix and checking next station to find one with videos...`
+        );
         continue;
       }
       summaryReport.push({
         stationId: task.stationIdMongo,
         camId: task.camIdExcelOrS3,
         totalS3Videos: 0,
+        processedRange: "N/A",
         processedVideosCount: 0,
-        totalHours: 0,
+        batchHours: 0,
+        accumulatedTotalHours: prevTotalHours,
         status: "No Videos Found",
       });
       continue;
     }
 
-    if (videoOffset >= allVideos.length) {
+    // Determine slice of videos to process based on startIndex and task.processedCountReq
+    let countToProcess = allVideos.length - startIndex;
+    if (task.processedCountReq !== null && task.processedCountReq > 0) {
+      countToProcess = task.processedCountReq;
+    }
+
+    const endIndex = Math.min(allVideos.length, startIndex + countToProcess);
+
+    if (startIndex >= allVideos.length || countToProcess <= 0) {
       console.warn(
-        ` [Warning] All ${allVideos.length} videos for station '${task.stationIdMongo}' were already processed in previous rows (Offset: ${videoOffset}). Skipping...`
+        ` [Warning] All available videos in S3 (${allVideos.length}) have already been processed for '${task.camIdExcelOrS3}'.`
       );
       summaryReport.push({
         stationId: task.stationIdMongo,
         camId: task.camIdExcelOrS3,
         totalS3Videos: allVideos.length,
+        processedRange: `Index ${startIndex + 1} - ${startIndex}`,
         processedVideosCount: 0,
-        totalHours: 0,
-        status: "Already Processed in Previous Row",
+        batchHours: 0,
+        accumulatedTotalHours: prevTotalHours,
+        status: "Already Processed / Out of Range",
       });
       continue;
     }
 
-    // Determine how many videos to process starting from videoOffset
-    const remainingVideosCount = allVideos.length - videoOffset;
-    let countToProcess = remainingVideosCount;
-    if (
-      task.processedCountReq !== null &&
-      task.processedCountReq > 0 &&
-      task.processedCountReq <= remainingVideosCount
-    ) {
-      countToProcess = task.processedCountReq;
-    }
-
-    const videosToProcess = allVideos.slice(videoOffset, videoOffset + countToProcess);
-
-    // Update offset map for future rows of the same station ID
-    stationVideoOffsetMap.set(normKey, videoOffset + videosToProcess.length);
+    const videosToProcess = allVideos.slice(startIndex, endIndex);
 
     console.log(
-      ` [LOG] Preparing to process ${videosToProcess.length} video(s) (video index ${videoOffset + 1} to ${videoOffset + videosToProcess.length} out of ${allVideos.length} total S3 videos)...`
+      ` [LOG] Preparing to process ${videosToProcess.length} video(s) (S3 index range: ${startIndex + 1} to ${endIndex} out of ${allVideos.length} total)...`
     );
 
-    let totalDurationSeconds = 0;
+    let batchDurationSeconds = 0;
     let successCount = 0;
 
     const CONCURRENCY = parseInt(process.env.CONCURRENCY || "30", 10);
@@ -703,10 +636,11 @@ async function main() {
       poolSize,
       videosToProcess,
       async (vKey, vIdx) => {
+        const globalIdx = startIndex + vIdx;
         if (isTestMode) {
           console.log(`\n   -------------------------------------------------`);
           console.log(
-            `   [LOG] Video [${vIdx + 1}/${countToProcess}] File: ${path.basename(
+            `   [LOG] Video [${vIdx + 1}/${videosToProcess.length}] (Global S3 Index ${globalIdx + 1}) File: ${path.basename(
               vKey
             )}`
           );
@@ -716,7 +650,7 @@ async function main() {
           const durationSec = await getVideoDurationSeconds(vKey, isTestMode);
           if (!isTestMode) {
             console.log(
-              `   Video [${vIdx + 1}/${countToProcess}] ${path.basename(
+              `   Video [${vIdx + 1}/${videosToProcess.length}] (Global Index ${globalIdx + 1}) ${path.basename(
                 vKey
               )} ... ${durationSec.toFixed(2)}s`
             );
@@ -725,7 +659,7 @@ async function main() {
         } catch (err: any) {
           if (!isTestMode) {
             console.log(
-              `   Video [${vIdx + 1}/${countToProcess}] ${path.basename(
+              `   Video [${vIdx + 1}/${videosToProcess.length}] ${path.basename(
                 vKey
               )} ... FAILED (${err.message})`
             );
@@ -739,63 +673,83 @@ async function main() {
 
     for (const res of probeResults) {
       if (res && res.success) {
-        totalDurationSeconds += res.durationSec;
+        batchDurationSeconds += res.durationSec;
         successCount++;
       }
     }
 
-    const newlyCalculatedHours = parseFloat((totalDurationSeconds / 3600).toFixed(4));
+    const batchHours = parseFloat((batchDurationSeconds / 3600).toFixed(4));
+    const newTotalHours = parseFloat((prevTotalHours + batchHours).toFixed(4));
+
     console.log(`\n=================================================`);
-    console.log(` STATION SUMMARY RESULT FOR ${task.stationIdMongo}:`);
-    console.log(` - Total Videos Probed Successfully : ${successCount}/${countToProcess}`);
-    console.log(` - Total Duration in Seconds       : ${totalDurationSeconds.toFixed(2)} seconds`);
-    console.log(` - Newly Calculated Hours           : ${newlyCalculatedHours} Hours`);
+    console.log(` SUMMARY RESULT FOR TASK ${i + 1} (${task.stationIdMongo}):`);
+    console.log(
+      ` - S3 Video Index Range            : ${startIndex + 1} to ${endIndex} of ${allVideos.length}`
+    );
+    console.log(
+      ` - Videos Probed Successfully     : ${successCount}/${videosToProcess.length}`
+    );
+    console.log(
+      ` - Batch Duration in Seconds      : ${batchDurationSeconds.toFixed(2)} seconds`
+    );
+    console.log(` - Batch Hours                    : ${batchHours} Hours`);
+    console.log(
+      ` - New Accumulated totalHours     : ${newTotalHours} Hours (Previous: ${prevTotalHours} + Batch: ${batchHours})`
+    );
     console.log(`=================================================`);
 
-    // Update MongoDB (Completely replaces pre-existing totalHours in DB with the combined total of this run's matched entries)
-    const previousRunHours = stationRunAccumulatedHoursMap.get(normKey) || 0;
-    const combinedRunTotalHours = parseFloat((previousRunHours + newlyCalculatedHours).toFixed(4));
-    stationRunAccumulatedHoursMap.set(normKey, combinedRunTotalHours);
+    // Update state map for next occurrence of this station
+    stationStateMap.set(normKey, {
+      startIndex: endIndex,
+      runningTotalHours: newTotalHours,
+    });
 
-    let matchedDoc = task.mongoDoc;
-    if (matchedDoc && matchedDoc._id) {
-      matchedDoc = await VehicleCounterStationResultModel.findById(matchedDoc._id);
-    }
-    if (!matchedDoc) {
-      matchedDoc = await VehicleCounterStationResultModel.findOne({
-        $or: [
-          { stationId: task.stationIdMongo },
-          { stationId: `cam-${task.camIdExcelOrS3.replace(/\//g, "_")}` },
-        ],
-      });
-    }
-
-    if (matchedDoc) {
+    // Update MongoDB
+    if (task.mongoDoc) {
       console.log(
-        ` [LOG] [Occurrence #${occurrence} of '${matchedDoc.stationId}'] Updating MongoDB totalHours: ${combinedRunTotalHours}h (Newly Calculated in this entry: ${newlyCalculatedHours}h, Replacing pre-run DB value)`
+        ` [LOG] Executing MongoDB Update for stationId '${task.mongoDoc.stationId}' (Document ID: ${task.mongoDoc._id})...`
       );
-
       const updateResult = await VehicleCounterStationResultModel.updateOne(
-        { _id: matchedDoc._id },
-        { $set: { totalHours: combinedRunTotalHours } }
+        { _id: task.mongoDoc._id },
+        { $set: { totalHours: newTotalHours } }
       );
       console.log(
         ` [LOG] MongoDB Update Result: matchedCount=${updateResult.matchedCount}, modifiedCount=${updateResult.modifiedCount}`
       );
     } else {
-      console.warn(
-        ` [Warning] No document found in MongoDB matching '${task.stationIdMongo}'.`
+      console.log(
+        ` [LOG] Searching MongoDB collection for matching document for '${task.stationIdMongo}'...`
       );
+      const matched = await VehicleCounterStationResultModel.findOne({
+        $or: [
+          { stationId: task.stationIdMongo },
+          { stationId: `cam-${task.camIdExcelOrS3.replace(/\//g, "_")}` },
+        ],
+      });
+
+      if (matched) {
+        const updateResult = await VehicleCounterStationResultModel.updateOne(
+          { _id: matched._id },
+          { $set: { totalHours: newTotalHours } }
+        );
+        console.log(
+          ` [LOG] MongoDB Update Result for matched stationId '${matched.stationId}': matchedCount=${updateResult.matchedCount}, modifiedCount=${updateResult.modifiedCount}`
+        );
+      } else {
+        console.warn(
+          ` [Warning] No document found in MongoDB matching '${task.stationIdMongo}'.`
+        );
+      }
     }
 
     summaryReport.push({
       stationId: task.stationIdMongo,
       camId: task.camIdExcelOrS3,
       totalS3Videos: allVideos.length,
-      processedVideosCount: countToProcess,
-      totalSeconds: parseFloat(totalDurationSeconds.toFixed(2)),
-      newlyCalculatedHours: newlyCalculatedHours,
-      totalHours: combinedRunTotalHours,
+      processedRange: `${startIndex + 1} - ${endIndex}`,
+      processedVideosCount: videosToProcess.length,
+      batchHours: batchHours,
+      accumulatedTotalHours: newTotalHours,
       status: "Success",
     });
 
