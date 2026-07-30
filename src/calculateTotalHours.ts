@@ -46,14 +46,14 @@ const TEST_SINGLE_STATION = false;
 // Optional filter for a specific station (e.g. "vehicle-counter-unprocessed-video/27 june/059"), or null for ALL stations
 const TARGET_STATION_FILTER: string | null = null;
 
-// Optional: Resume from a specific station ID (e.g. "vehicle-counter-unprocessed-video/3 july/020")
+// Optional: Resume from a specific station ID (e.g. "vehicle-counter-unprocessed-video/3 july/029")
 const START_STATION: string | null =
-  process.env.START_STATION || "vehicle-counter-unprocessed-video/3 july/020";
+  process.env.START_STATION || "vehicle-counter-unprocessed-video/3 july/029";
 
-// Optional: Resume from 0-based index (e.g. 64 for row 65)
+// Optional: Resume from 0-based index (e.g. 70 for row 71)
 const START_INDEX: number = process.env.START_INDEX
   ? parseInt(process.env.START_INDEX, 10)
-  : 0;
+  : 70;
 
 // ================= S3 CLIENT =================
 const s3Client = new S3Client({
@@ -84,7 +84,11 @@ function probeDuration(inputUrlOrFile: string): Promise<number> {
       "-v",
       "error",
       "-rw_timeout",
-      "10000000", // 10s network read/write timeout in microseconds
+      "5000000", // 5s network timeout in microseconds
+      "-probesize",
+      "32768", // Read max 32KB for header duration to avoid deep stream parsing
+      "-analyzeduration",
+      "0", // Stop analyzing stream data immediately after reading container header
       "-show_entries",
       "format=duration",
       "-of",
@@ -613,7 +617,7 @@ async function main() {
     let totalDurationSeconds = 0;
     let successCount = 0;
 
-    const CONCURRENCY = parseInt(process.env.CONCURRENCY || "15", 10);
+    const CONCURRENCY = parseInt(process.env.CONCURRENCY || "30", 10);
     const poolSize = isTestMode ? 1 : CONCURRENCY;
     console.log(
       ` [LOG] Probing video durations with concurrency level = ${poolSize}...`
