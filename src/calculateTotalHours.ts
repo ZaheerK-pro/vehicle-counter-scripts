@@ -41,11 +41,10 @@ if (!fs.existsSync(TEMP_DIR)) {
 }
 
 // Set TEST_SINGLE_STATION to false to process all stations
-const TEST_SINGLE_STATION = true;
+const TEST_SINGLE_STATION = false;
 
 // Optional filter for a specific station (e.g. "vehicle-counter-unprocessed-video/27 june/059"), or null for ALL stations
-const TARGET_STATION_FILTER: string | null =
-  "vehicle-counter-unprocessed-video/26 july/060";
+const TARGET_STATION_FILTER: string | null = null;
 
 // ================= S3 CLIENT =================
 const s3Client = new S3Client({
