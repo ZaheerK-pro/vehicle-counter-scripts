@@ -525,6 +525,7 @@ async function main() {
 
   const stationVideoOffsetMap = new Map<string, number>();
   const stationOccurrenceTracker = new Map<string, number>();
+  const stationRunAccumulatedHoursMap = new Map<string, number>();
 
   let resumeIndex = 0;
   if (TARGET_STATION_FILTER) {
@@ -751,7 +752,11 @@ async function main() {
     console.log(` - Newly Calculated Hours           : ${newlyCalculatedHours} Hours`);
     console.log(`=================================================`);
 
-    // Update MongoDB (Occurrence 1 sets initial totalHours; Occurrence 2+ accumulates)
+    // Update MongoDB (Completely replaces pre-existing totalHours in DB with the combined total of this run's matched entries)
+    const previousRunHours = stationRunAccumulatedHoursMap.get(normKey) || 0;
+    const combinedRunTotalHours = parseFloat((previousRunHours + newlyCalculatedHours).toFixed(4));
+    stationRunAccumulatedHoursMap.set(normKey, combinedRunTotalHours);
+
     let matchedDoc = task.mongoDoc;
     if (matchedDoc && matchedDoc._id) {
       matchedDoc = await VehicleCounterStationResultModel.findById(matchedDoc._id);
@@ -765,28 +770,14 @@ async function main() {
       });
     }
 
-    let finalTotalHours = newlyCalculatedHours;
     if (matchedDoc) {
-      if (occurrence === 1) {
-        finalTotalHours = newlyCalculatedHours;
-        console.log(
-          ` [LOG] [1st Occurrence of '${matchedDoc.stationId}'] Setting initial totalHours = ${finalTotalHours}h in MongoDB.`
-        );
-      } else {
-        const existingHours =
-          typeof matchedDoc.totalHours === "number" ? matchedDoc.totalHours : 0;
-        finalTotalHours = parseFloat((existingHours + newlyCalculatedHours).toFixed(4));
-        console.log(
-          ` [LOG] [Occurrence #${occurrence} of '${matchedDoc.stationId}'] Accumulating MongoDB totalHours:`
-        );
-        console.log(
-          `       Existing (${existingHours}h) + Newly Calculated (${newlyCalculatedHours}h) = Total Updated (${finalTotalHours}h)`
-        );
-      }
+      console.log(
+        ` [LOG] [Occurrence #${occurrence} of '${matchedDoc.stationId}'] Updating MongoDB totalHours: ${combinedRunTotalHours}h (Newly Calculated in this entry: ${newlyCalculatedHours}h, Replacing pre-run DB value)`
+      );
 
       const updateResult = await VehicleCounterStationResultModel.updateOne(
         { _id: matchedDoc._id },
-        { $set: { totalHours: finalTotalHours } }
+        { $set: { totalHours: combinedRunTotalHours } }
       );
       console.log(
         ` [LOG] MongoDB Update Result: matchedCount=${updateResult.matchedCount}, modifiedCount=${updateResult.modifiedCount}`
@@ -804,7 +795,7 @@ async function main() {
       processedVideosCount: countToProcess,
       totalSeconds: parseFloat(totalDurationSeconds.toFixed(2)),
       newlyCalculatedHours: newlyCalculatedHours,
-      totalHours: finalTotalHours,
+      totalHours: combinedRunTotalHours,
       status: "Success",
     });
 
