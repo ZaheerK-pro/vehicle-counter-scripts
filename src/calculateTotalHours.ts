@@ -97,6 +97,32 @@ function probeDuration(inputUrlOrFile: string): Promise<number> {
 }
 
 /**
+ * Helper function to run async tasks with a limit on concurrency.
+ */
+async function asyncPool<T, R>(
+  concurrency: number,
+  items: T[],
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results: R[] = new Array(items.length);
+  let index = 0;
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (index < items.length) {
+        const i = index++;
+        results[i] = await fn(items[i], i);
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
+}
+
+/**
  * Downloads an S3 object to local temp and probes its duration, then cleans up.
  */
 async function probeS3ObjectViaDownload(s3Key: string): Promise<number> {
@@ -389,11 +415,18 @@ async function main() {
   if (cliArgs.length > 0 && fs.existsSync(cliArgs[0])) {
     excelFilePath = cliArgs[0];
   } else {
-    // Check if any excel file is present in current directory or script directory
+    // Check if any excel file (station.xlsx, station.csv, stations.xlsx, stations.csv) is present
     const candidates = [
+      path.join(process.cwd(), "station.xlsx"),
+      path.join(process.cwd(), "station.csv"),
+      path.join(process.cwd(), "stations.xlsx"),
+      path.join(process.cwd(), "stations.csv"),
+      path.join(__dirname, "station.xlsx"),
+      path.join(__dirname, "station.csv"),
       path.join(__dirname, "stations.xlsx"),
       path.join(__dirname, "stations.csv"),
-      path.join(process.cwd(), "stations.xlsx"),
+      path.join(__dirname, "../station.xlsx"),
+      path.join(__dirname, "../stations.xlsx"),
     ];
     for (const c of candidates) {
       if (fs.existsSync(c)) {
@@ -538,39 +571,54 @@ async function main() {
     let totalDurationSeconds = 0;
     let successCount = 0;
 
-    for (let vIdx = 0; vIdx < videosToProcess.length; vIdx++) {
-      const vKey = videosToProcess[vIdx];
-      if (isTestMode) {
-        console.log(`\n   -------------------------------------------------`);
-        console.log(
-          `   [LOG] Video [${vIdx + 1}/${countToProcess}] File: ${path.basename(vKey)}`
-        );
-        console.log(`   [LOG] Full S3 Key: ${vKey}`);
-      } else {
-        process.stdout.write(
-          `   Video [${vIdx + 1}/${countToProcess}] ${path.basename(vKey)} ... `
-        );
-      }
-      try {
-        const durationSec = await getVideoDurationSeconds(vKey, isTestMode);
-        totalDurationSeconds += durationSec;
-        successCount++;
-        if (!isTestMode) {
-          console.log(`${durationSec.toFixed(2)}s`);
-        } else {
-          const currentHours = (totalDurationSeconds / 3600).toFixed(4);
+    const CONCURRENCY = parseInt(process.env.CONCURRENCY || "15", 10);
+    const poolSize = isTestMode ? 1 : CONCURRENCY;
+    console.log(
+      ` [LOG] Probing video durations with concurrency level = ${poolSize}...`
+    );
+
+    const probeResults = await asyncPool(
+      poolSize,
+      videosToProcess,
+      async (vKey, vIdx) => {
+        if (isTestMode) {
+          console.log(`\n   -------------------------------------------------`);
           console.log(
-            `   [LOG] Accumulated Duration so far: ${totalDurationSeconds.toFixed(
-              2
-            )}s (~${currentHours} Hours)`
+            `   [LOG] Video [${vIdx + 1}/${countToProcess}] File: ${path.basename(
+              vKey
+            )}`
           );
+          console.log(`   [LOG] Full S3 Key: ${vKey}`);
         }
-      } catch (err: any) {
-        if (!isTestMode) {
-          console.log(`FAILED (${err.message})`);
-        } else {
-          console.error(`   [ERROR] Failed to probe video: ${err.message}`);
+        try {
+          const durationSec = await getVideoDurationSeconds(vKey, isTestMode);
+          if (!isTestMode) {
+            console.log(
+              `   Video [${vIdx + 1}/${countToProcess}] ${path.basename(
+                vKey
+              )} ... ${durationSec.toFixed(2)}s`
+            );
+          }
+          return { durationSec, success: true };
+        } catch (err: any) {
+          if (!isTestMode) {
+            console.log(
+              `   Video [${vIdx + 1}/${countToProcess}] ${path.basename(
+                vKey
+              )} ... FAILED (${err.message})`
+            );
+          } else {
+            console.error(`   [ERROR] Failed to probe video: ${err.message}`);
+          }
+          return { durationSec: 0, success: false };
         }
+      }
+    );
+
+    for (const res of probeResults) {
+      if (res && res.success) {
+        totalDurationSeconds += res.durationSec;
+        successCount++;
       }
     }
 
