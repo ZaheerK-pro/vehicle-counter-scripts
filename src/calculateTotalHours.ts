@@ -46,6 +46,15 @@ const TEST_SINGLE_STATION = false;
 // Optional filter for a specific station (e.g. "vehicle-counter-unprocessed-video/27 june/059"), or null for ALL stations
 const TARGET_STATION_FILTER: string | null = null;
 
+// Optional: Resume from a specific station ID (e.g. "vehicle-counter-unprocessed-video/3 july/020")
+const START_STATION: string | null =
+  process.env.START_STATION || "vehicle-counter-unprocessed-video/3 july/020";
+
+// Optional: Resume from 0-based index (e.g. 64 for row 65)
+const START_INDEX: number = process.env.START_INDEX
+  ? parseInt(process.env.START_INDEX, 10)
+  : 0;
+
 // ================= S3 CLIENT =================
 const s3Client = new S3Client({
   region: AWS_REGION,
@@ -74,6 +83,8 @@ function probeDuration(inputUrlOrFile: string): Promise<number> {
     const args = [
       "-v",
       "error",
+      "-rw_timeout",
+      "10000000", // 10s network read/write timeout in microseconds
       "-show_entries",
       "format=duration",
       "-of",
@@ -506,6 +517,37 @@ async function main() {
         },
       ];
     }
+  } else if (START_STATION) {
+    const normStart = normalizeStationId(START_STATION);
+    const startIdx = stationTasks.findIndex((t) => {
+      return (
+        normalizeStationId(t.stationIdMongo).includes(normStart) ||
+        normalizeStationId(t.camIdExcelOrS3).includes(normStart) ||
+        normalizeStationId(t.s3Prefix).includes(normStart)
+      );
+    });
+
+    if (startIdx !== -1) {
+      console.log(
+        `\n [RESUME] Found starting station '${START_STATION}' at position ${startIdx + 1}/${stationTasks.length}. Slicing remaining ${stationTasks.length - startIdx} task(s)...`
+      );
+      stationTasks = stationTasks.slice(startIdx);
+    } else {
+      console.warn(
+        `\n [WARNING] Starting station '${START_STATION}' not found in task list.`
+      );
+      if (START_INDEX > 0 && START_INDEX < stationTasks.length) {
+        console.log(
+          ` [RESUME] Falling back to start from index ${START_INDEX}...`
+        );
+        stationTasks = stationTasks.slice(START_INDEX);
+      }
+    }
+  } else if (START_INDEX > 0 && START_INDEX < stationTasks.length) {
+    console.log(
+      `\n [RESUME] Starting from index ${START_INDEX} (${stationTasks.length - START_INDEX} remaining task(s)).`
+    );
+    stationTasks = stationTasks.slice(START_INDEX);
   }
 
   const isTestMode =
