@@ -197,10 +197,20 @@ async function downloadVideo(key, output) {
   );
 }
 
-function convertVideo(input, output) {
+const USE_NVENC =
+  process.argv.includes("--nvenc") ||
+  process.argv.includes("--gpu") ||
+  process.env.USE_NVENC === "true" ||
+  true; // Enable NVENC by default for high-performance GPU hardware acceleration
+
+function convertVideo(input, output, tryNvenc = USE_NVENC) {
   return new Promise((resolve, reject) => {
     console.log("\n========================================");
-    console.log("Starting FFmpeg...");
+    console.log(`Starting FFmpeg (${tryNvenc ? "GPU RTX NVENC Accelerated" : "CPU x264"})...`);
+
+    const videoCodecArgs = tryNvenc
+      ? ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28"]
+      : ["-c:v", "libx264", "-threads", "4", "-preset", "veryfast", "-crf", "28"];
 
     const args = [
       "-y",
@@ -216,14 +226,7 @@ function convertVideo(input, output) {
       "0:v:0",
       "-map",
       "0:a:0",
-      "-c:v",
-      "libx264",
-      "-threads",
-      "4",
-      "-preset",
-      "veryfast",
-      "-crf",
-      "28",
+      ...videoCodecArgs,
       "-pix_fmt",
       "yuv420p",
       "-movflags",
@@ -259,6 +262,11 @@ function convertVideo(input, output) {
           "MB"
         );
         resolve();
+      } else if (tryNvenc) {
+        console.warn(
+          "\n[NVENC Warning] GPU NVENC conversion failed or not supported in current FFmpeg build. Falling back to CPU (libx264)..."
+        );
+        convertVideo(input, output, false).then(resolve).catch(reject);
       } else {
         reject(new Error(`FFmpeg exited with code ${code}`));
       }
