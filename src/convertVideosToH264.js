@@ -5,6 +5,7 @@ const {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
+  ListObjectsV2Command,
 } = require("@aws-sdk/client-s3");
 
 const fs = require("fs");
@@ -336,6 +337,56 @@ function getCamIdVariations(camId) {
 }
 
 /**
+ * Extract camera number/ID from full S3 path or prefix if applicable
+ * e.g. "vehicle-counter-unprocessed-video/27 june/066" -> "066"
+ */
+function extractCamIdNumber(camIdRaw) {
+  if (!camIdRaw) return "";
+  const clean = cleanS3Key(String(camIdRaw)).replace(/\/+$/, "");
+  const base = path.basename(clean);
+  if (/^\d+$/.test(base)) return base;
+  return clean;
+}
+
+/**
+ * List all non-h264 video objects in S3 under a prefix folder
+ */
+async function listVideosInS3(prefix) {
+  if (!prefix) return [];
+  let cleanPrefix = cleanS3Key(prefix);
+  if (!cleanPrefix.endsWith("/") && !path.extname(cleanPrefix)) {
+    cleanPrefix += "/";
+  }
+
+  const videos = [];
+  let ContinuationToken = undefined;
+
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: cleanPrefix,
+        ContinuationToken,
+      })
+    );
+
+    if (res.Contents) {
+      for (const obj of res.Contents) {
+        if (!obj.Key) continue;
+        const key = obj.Key;
+        if (key.endsWith("_h264.mp4") || key.endsWith("_h264.ts") || key.endsWith("_h264.TS")) continue;
+        if (/\.(mp4|mov|avi|mkv|ts)$/i.test(key)) {
+          videos.push(key);
+        }
+      }
+    }
+    ContinuationToken = res.NextContinuationToken;
+  } while (ContinuationToken);
+
+  return videos;
+}
+
+/**
  * Find MongoDB document by date, cam_id, and original video keys
  */
 async function findMongoDocument(camId, rawDate, dayKey, nightKey, row = {}) {
@@ -439,70 +490,96 @@ async function processRow(row, rowIndex) {
   console.log(`\n--------------------------------------------------`);
   console.log(`Processing Row #${rowIndex + 1}:`, row);
 
-  const camId =
+  const camIdRaw = String(
+    row["cam ID"] ||
+    row["Cam ID"] ||
+    row["cam_id"] ||
     row.cam_id ||
     row.camId ||
-    row["cam_id"] ||
-    row["Cam ID"] ||
     row["Camera ID"] ||
-    "";
+    ""
+  ).trim();
 
+  const camIdNum = extractCamIdNumber(camIdRaw);
   const rawDate = row.date || row.Date || row.DATE || null;
 
-  const dayObjectKey = cleanS3Key(
+  let dayObjectKey = cleanS3Key(
     row.dayObjectKey ||
       row.day_object_key ||
       row.dayKey ||
       row.dayVideoUrl ||
+      row.dayUrl ||
       row["Day Object Key"] ||
       row["day_object_key"] ||
       ""
   );
 
-  const nightObjectKey = cleanS3Key(
+  let nightObjectKey = cleanS3Key(
     row.nightObjectKey ||
       row.night_object_key ||
       row.nightKey ||
       row.nightVideoUrl ||
+      row.nightUrl ||
       row["Night Object Key"] ||
       row["night_object_key"] ||
       ""
   );
 
-  if (!dayObjectKey && !nightObjectKey) {
-    console.warn(`Row #${rowIndex + 1} has no dayObjectKey or nightObjectKey. Skipping.`);
+  let videoKeysToProcess = [];
+  if (dayObjectKey) videoKeysToProcess.push({ type: "day", key: dayObjectKey });
+  if (nightObjectKey) videoKeysToProcess.push({ type: "night", key: nightObjectKey });
+
+  // If no explicit day/night key columns, query S3 using cam ID prefix
+  if (videoKeysToProcess.length === 0 && camIdRaw) {
+    if (/\.(mp4|mov|avi|mkv|ts)$/i.test(camIdRaw)) {
+      videoKeysToProcess.push({ type: "video", key: cleanS3Key(camIdRaw) });
+    } else {
+      console.log(`Listing S3 videos for folder prefix: "${camIdRaw}"...`);
+      const s3Videos = await listVideosInS3(camIdRaw);
+      console.log(`Found ${s3Videos.length} video file(s) under S3 prefix "${camIdRaw}".`);
+      s3Videos.forEach((vKey, idx) => {
+        videoKeysToProcess.push({ type: `video_${idx + 1}`, key: vKey });
+      });
+    }
+  }
+
+  if (videoKeysToProcess.length === 0) {
+    console.warn(`Row #${rowIndex + 1} has no dayObjectKey, nightObjectKey, or matching S3 videos. Skipping.`);
     return;
   }
 
-  console.log(`Row details -> cam_id: "${camId}", date: "${rawDate}"`);
-  console.log(`dayObjectKey: "${dayObjectKey}"`);
-  console.log(`nightObjectKey: "${nightObjectKey}"`);
+  console.log(`Row #${rowIndex + 1} details -> cam_id: "${camIdNum}" (${camIdRaw}), date: "${rawDate}"`);
+  console.log(`Total videos to process for Row #${rowIndex + 1}: ${videoKeysToProcess.length}`);
 
-  // Step A: Convert day video if key exists
-  let newDayKey = null;
-  if (dayObjectKey) {
-    console.log(`\n--- Processing Day Video ---`);
-    newDayKey = await processSingleVideo(dayObjectKey);
+  const processedResults = [];
+  for (const item of videoKeysToProcess) {
+    console.log(`\n--- Processing ${item.type} Video: "${item.key}" ---`);
+    const newKey = await processSingleVideo(item.key);
+    if (newKey) {
+      processedResults.push({ type: item.type, originalKey: item.key, newKey });
+    }
   }
 
-  // Step B: Convert night video if key exists
-  let newNightKey = null;
-  if (nightObjectKey) {
-    console.log(`\n--- Processing Night Video ---`);
-    newNightKey = await processSingleVideo(nightObjectKey);
-  }
-
-  // Step C: Find and update document in MongoDB
-  if (MONGO_URI) {
-    console.log(`\nUpdating MongoDB for cam_id: "${camId}", date: "${rawDate}"...`);
-    const doc = await findMongoDocument(camId, rawDate, dayObjectKey, nightObjectKey, row);
+  // MongoDB Update
+  if (MONGO_URI && processedResults.length > 0) {
+    console.log(`\nUpdating MongoDB for cam_id: "${camIdNum}", date: "${rawDate}"...`);
+    const doc = await findMongoDocument(camIdNum || camIdRaw, rawDate, dayObjectKey, nightObjectKey, row);
 
     if (doc) {
-      if (newDayKey) {
-        doc.dayVideoUrl = newDayKey;
-      }
-      if (newNightKey) {
-        doc.nightVideoUrl = newNightKey;
+      for (const res of processedResults) {
+        if (res.type === "day") {
+          doc.dayVideoUrl = res.newKey;
+        } else if (res.type === "night") {
+          doc.nightVideoUrl = res.newKey;
+        } else {
+          if (!doc.dayVideoUrl || doc.dayVideoUrl.includes(cleanS3Key(res.originalKey))) {
+            doc.dayVideoUrl = res.newKey;
+          } else if (!doc.nightVideoUrl || doc.nightVideoUrl.includes(cleanS3Key(res.originalKey))) {
+            doc.nightVideoUrl = res.newKey;
+          } else {
+            doc.dayVideoUrl = res.newKey;
+          }
+        }
       }
       await doc.save();
       console.log(`Successfully updated MongoDB Document (ID: ${doc._id})`);
@@ -510,10 +587,10 @@ async function processRow(row, rowIndex) {
       console.log(`  nightVideoUrl: "${doc.nightVideoUrl}"`);
     } else {
       console.error(
-        `MongoDB Document NOT FOUND for cam_id: "${camId}", date: "${rawDate}". Could not update video URLs.`
+        `MongoDB Document NOT FOUND for cam_id: "${camIdNum}" (${camIdRaw}), date: "${rawDate}". Could not update video URLs.`
       );
     }
-  } else {
+  } else if (!MONGO_URI) {
     console.warn("MONGO_URI not provided. Skipping MongoDB update.");
   }
 }
